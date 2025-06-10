@@ -1,52 +1,68 @@
 import flwr as fl
-from ultralytics import YOLO
+import tensorflow as tf
+import numpy as np
 import os
-import torch
-import gc
+import json
 
 CLIENT_ID = os.environ.get("CLIENT_ID", "client_1")
-DATA_DIR = f"./{CLIENT_ID}"
-MODEL_PATH = "yolov8n.pt"
+IMG_DIR = "JPEGImages"
+ANNOTATION_DIR = "Annotations"
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 16
+NUM_CLASSES = 9
+train_list_path = f"{CLIENT_ID}.txt"
 
-# 限制 CPU 使用
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)  # 限制 PyTorch 自行多執行緒
+def load_data(file_path):
+    with open(file_path) as f:
+        filenames = [line.strip() for line in f.readlines()]
 
-class YOLOClient(fl.client.NumPyClient):
-    def __init__(self):
-        self.model = YOLO(MODEL_PATH)
+    images, labels = [], []
+    for name in filenames:
+        img_path = os.path.join(IMG_DIR, f"{name}.jpg")
+        json_path = os.path.join(ANNOTATION_DIR, f"{name}.json")
+        if not os.path.exists(img_path) or not os.path.exists(json_path):
+            continue
+        img = tf.keras.utils.load_img(img_path, target_size=IMG_SIZE)
+        img = tf.keras.utils.img_to_array(img) / 255.0
+        with open(json_path) as jf:
+            label = json.load(jf).get("action")
+        if label is None:
+            continue
+        images.append(img)
+        labels.append(label)
+    label_to_index = {name: i for i, name in enumerate(sorted(set(labels)))}
+    int_labels = [label_to_index[l] for l in labels]
+    y = tf.keras.utils.to_categorical(int_labels, num_classes=NUM_CLASSES)
+    return tf.data.Dataset.from_tensor_slices((np.array(images), y)).shuffle(1000).batch(BATCH_SIZE)
 
+train_ds = load_data(train_list_path)
+
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(224, 224, 3)),
+    tf.keras.layers.Conv2D(32, 3, activation='relu'),
+    tf.keras.layers.MaxPooling2D(),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(64, activation='relu'),
+    tf.keras.layers.Dense(NUM_CLASSES, activation='softmax')
+])
+
+model.compile(optimizer='adam',
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+class FlowerClient(fl.client.NumPyClient):
     def get_parameters(self, config):
-        return self.model.model.state_dict()
+        return model.get_weights()
 
     def set_parameters(self, parameters):
-        self.model.model.load_state_dict(parameters)
+        model.set_weights(parameters)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-
-        self.model.train(
-            data={
-                "train": os.path.join(DATA_DIR, "images/train"),
-                "val": os.path.join(DATA_DIR, "images/train"),
-                "names": ["squat", "run", "sit", "stretch", "walk", "jump", "bendover", "stand", "lying"],
-                "nc": 9
-            },
-            epochs=1,
-            imgsz=224,     # 更小輸入尺寸
-            batch=1,       # 最小 batch
-            workers=0,     # 關掉 dataloader 執行緒
-            device="cpu",
-            close_mosaic=True  # 關閉 mosaic（減少記憶體）
-        )
-
-        # 強制釋放記憶體
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        return self.get_parameters(config={}), 1, {}
+        model.fit(train_ds, epochs=1)
+        return self.get_parameters(config), len(train_ds), {}
 
     def evaluate(self, parameters, config):
         return 0.0, 0, {}
 
-fl.client.start_numpy_client(server_address="192.168.183.128:8080", client=YOLOClient())
+fl.client.start_numpy_client(server_address="192.168.183.128:8080", client=FlowerClient())
